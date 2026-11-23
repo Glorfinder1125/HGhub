@@ -1,0 +1,97 @@
+name: HGhub Android 8.1 Compatibility Diagnostic
+on:
+  workflow_dispatch:
+jobs:
+  android81:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Prepare Android SDK and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install 'platform-tools' 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android81-diag
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Apply compatibility and startup diagnostics (CI only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('vite.config.ts')
+          s=p.read_text()
+          assert 'target: "es2021"' in s, 'vite target changed; review workflow'
+          p.write_text(s.replace('target: "es2021"', 'target: "es2017"'))
+          p=Path('index.html')
+          s=p.read_text()
+          assert '<div id="root"></div>' in s
+          s=s.replace('<div id="root"></div>', '''<div id="hg-diag" style="position:fixed;inset:0;z-index:2147483647;overflow:auto;background:#10202b;color:#fff;padding:24px;font:15px/1.6 sans-serif;box-sizing:border-box"><h2>HGhub Android 8.1 诊断</h2><p id="hg-status">HTML 已加载；等待 JavaScript...</p><pre id="hg-log" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre><button id="hg-enter" style="display:none;padding:12px">进入原应用</button></div><div id="root"></div><script src="/hg-diag.js"></script>''')
+          p.write_text(s)
+          Path('public').mkdir(exist_ok=True)
+          Path('public/hg-diag.js').write_text('''(function(){
+            var log=document.getElementById('hg-log');
+            var status=document.getElementById('hg-status');
+            var enter=document.getElementById('hg-enter');
+            function add(s){log.textContent+=String(s)+'\\n';}
+            function msg(e){return (e&&e.message)||String(e);}
+            status.textContent='JavaScript 已执行';
+            add('UserAgent: '+navigator.userAgent);
+            add('ES2017 basic: '+(typeof Promise==='function'?'OK':'MISSING'));
+            add('ResizeObserver: '+typeof ResizeObserver);
+            add('fetch: '+typeof fetch);
+            add('Tauri internals: '+typeof window.__TAURI_INTERNALS__);
+            window.addEventListener('error',function(e){add('JS ERROR: '+(e.message||'unknown')+' @ '+(e.filename||'')+':'+(e.lineno||''));});
+            window.addEventListener('unhandledrejection',function(e){add('PROMISE ERROR: '+msg(e.reason));});
+            function check(){
+              var root=document.getElementById('root');
+              if(root&&root.children.length){
+                status.textContent='React 已渲染；可进入原应用';
+                enter.style.display='inline-block';
+              }else{add('React root: EMPTY after 8 seconds');status.textContent='React 未渲染，请截图下方信息';}
+            }
+            enter.onclick=function(){document.getElementById('hg-diag').style.display='none';};
+            setTimeout(check,8000);
+          })();''')
+          PY
+      - name: Initialize Android project
+        run: pnpm tauri android init --ci
+      - name: Build Android 8.1 diagnostic APK
+        run: pnpm tauri android build --debug --apk --target aarch64
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -exec cp {} artifacts/ \;
+          test -n "$(find artifacts -maxdepth 1 -name '*.apk' -print -quit)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-Android81-diagnostic-arm64
+          path: artifacts/*.apk
+          if-no-files-found: error
